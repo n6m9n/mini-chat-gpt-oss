@@ -1,0 +1,162 @@
+"""
+Training loop for mini-gpt-oss (~250M params, gpt-oss architecture).
+
+Prepare data first:
+    python data.py --split validation         # quick start
+    python data.py --split train               # full corpus (recommended)
+
+Then train (a CUDA GPU is strongly recommended for a 250M model):
+    python train.py --device cuda --batch_size 16 --grad_accum 4 --max_iters 20000
+
+On Apple Silicon: --device mps. On CPU it will run but very slowly.
+
+The best checkpoint (by val loss) is saved to out/ckpt.pt, bundling the weights
+and the ModelConfig, so generate.py is self-contained.
+"""
+
+import argparse
+import os
+import time
+from contextlib import nullcontext
+
+import numpy as np
+import torch
+
+from model import MiniGPTOSS, ModelConfig
+from tokenizer import VOCAB_SIZE
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+DATA_DIR = os.path.join(HERE, "data")
+OUT_DIR = os.path.join(HERE, "out")
+
+
+def pick_device(req):
+    if req != "auto":
+        return req
+    if torch.cuda.is_available():
+        return "cuda"
+    if torch.backends.mps.is_available():
+        return "mps"
+    return "cpu"
+
+
+def get_batch(split, cfg, batch_size, device):
+    data = np.memmap(os.path.join(DATA_DIR, f"{split}.bin"), dtype=np.uint32, mode="r")
+    ix = torch.randint(len(data) - cfg.block_size - 1, (batch_size,))
+    x = torch.stack([torch.from_numpy(data[i : i + cfg.block_size].astype(np.int64)) for i in ix])
+    y = torch.stack([torch.from_numpy(data[i + 1 : i + 1 + cfg.block_size].astype(np.int64)) for i in ix])
+    if device == "cuda":
+        x, y = x.pin_memory().to(device, non_blocking=True), y.pin_memory().to(device, non_blocking=True)
+    else:
+        x, y = x.to(device), y.to(device)
+    return x, y
+
+
+@torch.no_grad()
+def estimate_loss(model, cfg, batch_size, device, ctx, eval_iters=50):
+    out = {}
+    model.eval()
+    for split in ("train", "val"):
+        losses = torch.zeros(eval_iters)
+        for k in range(eval_iters):
+            x, y = get_batch(split, cfg, batch_size, device)
+            with ctx:
+                _, loss = model(x, y)
+            losses[k] = loss.item()
+        out[split] = losses.mean().item()
+    model.train()
+    return out
+
+
+def get_lr(it, warmup, max_iters, lr, min_lr):
+    if it < warmup:
+        return lr * (it + 1) / warmup
+    if it > max_iters:
+        return min_lr
+    ratio = (it - warmup) / max(1, (max_iters - warmup))
+    coeff = 0.5 * (1.0 + np.cos(np.pi * ratio))
+    return min_lr + coeff * (lr - min_lr)
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--device", default="auto")
+    ap.add_argument("--batch_size", type=int, default=16)
+    ap.add_argument("--grad_accum", type=int, default=4, help="micro-batches per optimizer step")
+    ap.add_argument("--block_size", type=int, default=512)
+    ap.add_argument("--max_iters", type=int, default=20000)
+    ap.add_argument("--eval_interval", type=int, default=500)
+    ap.add_argument("--lr", type=float, default=6e-4)
+    ap.add_argument("--min_lr", type=float, default=6e-5)
+    ap.add_argument("--warmup", type=int, default=500)
+    ap.add_argument("--weight_decay", type=float, default=0.1)
+    ap.add_argument("--grad_clip", type=float, default=1.0)
+    ap.add_argument("--compile", action="store_true", help="torch.compile the model (CUDA)")
+    ap.add_argument("--seed", type=int, default=1337)
+    args = ap.parse_args()
+
+    torch.manual_seed(args.seed)
+    device = pick_device(args.device)
+    device_type = "cuda" if "cuda" in device else ("mps" if device == "mps" else "cpu")
+    print(f"device: {device}")
+
+    # mixed precision on CUDA for speed/memory; fp32 elsewhere
+    use_amp = device_type == "cuda"
+    amp_dtype = torch.bfloat16 if (use_amp and torch.cuda.is_bf16_supported()) else torch.float16
+    ctx = torch.autocast(device_type="cuda", dtype=amp_dtype) if use_amp else nullcontext()
+    scaler = torch.cuda.amp.GradScaler(enabled=(use_amp and amp_dtype == torch.float16))
+
+    cfg = ModelConfig(vocab_size=VOCAB_SIZE, block_size=args.block_size,
+                      initial_context_length=args.block_size)
+    model = MiniGPTOSS(cfg).to(device)
+    print(f"parameters: {model.num_params() / 1e6:.1f}M total | "
+          f"{model.num_params(non_embedding=True) / 1e6:.1f}M non-embedding")
+    if args.compile:
+        model = torch.compile(model)
+
+    optimizer = torch.optim.AdamW(
+        model.parameters(), lr=args.lr, weight_decay=args.weight_decay, betas=(0.9, 0.95)
+    )
+
+    os.makedirs(OUT_DIR, exist_ok=True)
+    best_val = float("inf")
+    t0 = time.time()
+    model.train()
+
+    for it in range(args.max_iters + 1):
+        lr = get_lr(it, args.warmup, args.max_iters, args.lr, args.min_lr)
+        for g in optimizer.param_groups:
+            g["lr"] = lr
+
+        if it % args.eval_interval == 0:
+            losses = estimate_loss(model, cfg, args.batch_size, device, ctx)
+            print(f"iter {it:6d} | train {losses['train']:.4f} | val {losses['val']:.4f} "
+                  f"| lr {lr:.2e} | {time.time() - t0:.0f}s")
+            if losses["val"] < best_val:
+                best_val = losses["val"]
+                raw = getattr(model, "_orig_mod", model)  # unwrap torch.compile
+                torch.save({"model": raw.state_dict(), "config": cfg, "val_loss": best_val},
+                           os.path.join(OUT_DIR, "ckpt.pt"))
+
+        if it == args.max_iters:
+            break
+
+        # gradient accumulation
+        optimizer.zero_grad(set_to_none=True)
+        for micro in range(args.grad_accum):
+            x, y = get_batch("train", cfg, args.batch_size, device)
+            with ctx:
+                _, loss = model(x, y)
+                loss = loss / args.grad_accum
+            scaler.scale(loss).backward()
+        if args.grad_clip > 0:
+            scaler.unscale_(optimizer)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
+        scaler.step(optimizer)
+        scaler.update()
+
+    print(f"done. best val loss: {best_val:.4f}  ->  {os.path.join(OUT_DIR, 'ckpt.pt')}")
+
+
+if __name__ == "__main__":
+    main()
