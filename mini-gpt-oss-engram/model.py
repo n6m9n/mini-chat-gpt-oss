@@ -22,6 +22,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.utils.checkpoint import checkpoint
 
 from engram import EngramBlock
 
@@ -53,6 +54,7 @@ class ModelConfig:
     intermediate_size: int = 768
     swiglu_limit: float = 7.0
     aux_loss_coef: float = 0.01
+    loss_chunk_size: int = 512        # chunked cross-entropy: tokens per logits chunk
 
     # RoPE / YaRN
     rope_theta: float = 10000.0
@@ -259,6 +261,26 @@ class TransformerBlock(nn.Module):
         return x, aux
 
 
+def _ce_chunk(h, weight, targets, ignore_index):
+    logits = F.linear(h, weight).float()          # [chunk, vocab] in fp32 for stable CE
+    return F.cross_entropy(logits, targets, ignore_index=ignore_index, reduction="sum")
+
+
+def chunked_cross_entropy(hidden, weight, targets, chunk_size, ignore_index=-1):
+    """Cross-entropy WITHOUT materializing the full [N, vocab] logits at once.
+    Tokens are processed in chunks and each chunk's logits are recomputed in the
+    backward pass (gradient checkpointing), so peak memory is ~one chunk of
+    logits instead of the whole [B, T, 201088] tensor."""
+    total = hidden.new_zeros(())
+    count = hidden.new_zeros((), dtype=torch.long)
+    for i in range(0, hidden.size(0), chunk_size):
+        h = hidden[i:i + chunk_size]
+        t = targets[i:i + chunk_size]
+        total = total + checkpoint(_ce_chunk, h, weight, t, ignore_index, use_reentrant=False)
+        count = count + (t != ignore_index).sum()
+    return total / count.clamp(min=1)
+
+
 class MiniGPTOSS(nn.Module):
     def __init__(self, config):
         super().__init__()
@@ -301,12 +323,16 @@ class MiniGPTOSS(nn.Module):
             x, aux = block(x, c)
             aux_total = aux_total + aux
         x = self.norm(x)
-        logits = self.unembedding(x)
-        loss = None
-        if targets is not None:
-            ce = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1)
-            loss = ce + (aux_total / len(self.blocks)) * self.config.aux_loss_coef
-        return logits, loss
+
+        if targets is None:                                # inference: full logits, no loss
+            return self.unembedding(x), None
+
+        # training: chunked cross-entropy (never materialize the full logits)
+        hidden = x.reshape(-1, x.size(-1))
+        ce = chunked_cross_entropy(hidden, self.unembedding.weight,
+                                   targets.reshape(-1), self.config.loss_chunk_size)
+        loss = ce + (aux_total / len(self.blocks)) * self.config.aux_loss_coef
+        return None, loss
 
     @torch.no_grad()
     def generate(self, idx, max_new_tokens, temperature=1.0, top_k=None, eot_token=None):
@@ -343,6 +369,7 @@ if __name__ == "__main__":
     print(f"  of which Engram     : {model.num_params(engram_only=True) / 1e6:.1f}M")
     print(f"non-embedding params : {model.num_params(non_embedding=True) / 1e6:.1f}M")
     x = torch.randint(0, cfg.vocab_size, (2, 64))
-    logits, loss = model(x, x)
+    logits, _ = model(x)              # inference path -> full logits
+    _, loss = model(x, x)             # training path  -> chunked-CE loss
     print(f"logits shape         : {tuple(logits.shape)}")
     print(f"loss (random init)   : {loss.item():.3f}")

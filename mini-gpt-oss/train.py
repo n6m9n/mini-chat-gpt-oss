@@ -79,6 +79,11 @@ def get_lr(it, warmup, max_iters, lr, min_lr):
     return min_lr + coeff * (lr - min_lr)
 
 
+def fmt_hms(seconds):
+    seconds = int(max(seconds, 0))
+    return f"{seconds // 3600}:{(seconds % 3600) // 60:02d}:{seconds % 60:02d}"
+
+
 def save_full(path, model, optimizer, scaler, it, best_val, cfg):
     """Full training state, so a run can resume after Kaggle's 12h session limit."""
     raw = getattr(model, "_orig_mod", model)  # unwrap torch.compile
@@ -102,6 +107,7 @@ def main():
     ap.add_argument("--grad_clip", type=float, default=1.0)
     ap.add_argument("--compile", action="store_true", help="torch.compile the model (CUDA)")
     ap.add_argument("--resume", action="store_true", help="resume from out/latest.pt if present")
+    ap.add_argument("--log_interval", type=int, default=20, help="print a progress line every N iters")
     ap.add_argument("--seed", type=int, default=1337)
     args = ap.parse_args()
 
@@ -141,7 +147,8 @@ def main():
         start_iter, best_val = ck["iter"] + 1, ck["best_val"]
         print(f"resumed from {latest_path} at iter {start_iter} (best_val {best_val:.4f})")
 
-    t0 = time.time()
+    tokens_per_iter = args.batch_size * args.block_size * args.grad_accum
+    t0 = t_log = time.time()
     model.train()
 
     for it in range(start_iter, args.max_iters + 1):
@@ -151,8 +158,8 @@ def main():
 
         if it % args.eval_interval == 0:
             losses = estimate_loss(model, cfg, args.batch_size, device, ctx)
-            print(f"iter {it:6d} | train {losses['train']:.4f} | val {losses['val']:.4f} "
-                  f"| lr {lr:.2e} | {time.time() - t0:.0f}s")
+            print(f"[eval] iter {it:6d} | train {losses['train']:.4f} | val {losses['val']:.4f} "
+                  f"| lr {lr:.2e} | elapsed {fmt_hms(time.time() - t0)}", flush=True)
             if losses["val"] < best_val:
                 best_val = losses["val"]
                 raw = getattr(model, "_orig_mod", model)  # unwrap torch.compile
@@ -177,7 +184,18 @@ def main():
         scaler.step(optimizer)
         scaler.update()
 
-    print(f"done. best val loss: {best_val:.4f}  ->  {os.path.join(OUT_DIR, 'ckpt.pt')}")
+        # live progress line
+        if it % args.log_interval == 0:
+            now = time.time()
+            tps = args.log_interval * tokens_per_iter / (now - t_log)
+            t_log = now
+            done = it - start_iter + 1
+            eta = (args.max_iters - it) * (now - t0) / max(done, 1)
+            print(f"iter {it:6d}/{args.max_iters} ({100 * it / args.max_iters:4.1f}%) | "
+                  f"loss {loss.item() * args.grad_accum:.3f} | {tps:6.0f} tok/s | "
+                  f"elapsed {fmt_hms(now - t0)} | eta {fmt_hms(eta)}", flush=True)
+
+    print(f"done. best val loss: {best_val:.4f}  ->  {best_path}", flush=True)
 
 
 if __name__ == "__main__":
