@@ -15,6 +15,7 @@ from model import MiniGPTOSS
 from tokenizer import EOT, decode, encode
 
 HERE = os.path.dirname(os.path.abspath(__file__))
+OUT_DIR = os.environ.get("OUT_DIR", os.path.join(HERE, "out"))
 
 
 def pick_device(req):
@@ -29,7 +30,7 @@ def pick_device(req):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--ckpt", default=os.path.join(HERE, "out", "ckpt.pt"))
+    ap.add_argument("--ckpt", default=os.path.join(OUT_DIR, "ckpt.pt"))
     ap.add_argument("--prompt", default="Once upon a time")
     ap.add_argument("--max_new_tokens", type=int, default=300)
     ap.add_argument("--temperature", type=float, default=0.8)
