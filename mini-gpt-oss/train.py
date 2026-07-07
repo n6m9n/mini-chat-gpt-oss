@@ -26,8 +26,9 @@ from model import MiniGPTOSS, ModelConfig
 from tokenizer import VOCAB_SIZE
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-DATA_DIR = os.path.join(HERE, "data")
-OUT_DIR = os.path.join(HERE, "out")
+# override via env for shared data / writable output (e.g. Kaggle /kaggle/working)
+DATA_DIR = os.environ.get("DATA_DIR", os.path.join(HERE, "data"))
+OUT_DIR = os.environ.get("OUT_DIR", os.path.join(HERE, "out"))
 
 
 def pick_device(req):
@@ -78,6 +79,14 @@ def get_lr(it, warmup, max_iters, lr, min_lr):
     return min_lr + coeff * (lr - min_lr)
 
 
+def save_full(path, model, optimizer, scaler, it, best_val, cfg):
+    """Full training state, so a run can resume after Kaggle's 12h session limit."""
+    raw = getattr(model, "_orig_mod", model)  # unwrap torch.compile
+    torch.save({"model": raw.state_dict(), "optimizer": optimizer.state_dict(),
+                "scaler": scaler.state_dict(), "iter": it, "best_val": best_val,
+                "config": cfg}, path)
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--device", default="auto")
@@ -92,6 +101,7 @@ def main():
     ap.add_argument("--weight_decay", type=float, default=0.1)
     ap.add_argument("--grad_clip", type=float, default=1.0)
     ap.add_argument("--compile", action="store_true", help="torch.compile the model (CUDA)")
+    ap.add_argument("--resume", action="store_true", help="resume from out/latest.pt if present")
     ap.add_argument("--seed", type=int, default=1337)
     args = ap.parse_args()
 
@@ -119,11 +129,22 @@ def main():
     )
 
     os.makedirs(OUT_DIR, exist_ok=True)
-    best_val = float("inf")
+    latest_path = os.path.join(OUT_DIR, "latest.pt")
+    best_path = os.path.join(OUT_DIR, "ckpt.pt")
+    start_iter, best_val = 0, float("inf")
+
+    if args.resume and os.path.exists(latest_path):
+        ck = torch.load(latest_path, map_location=device, weights_only=False)
+        getattr(model, "_orig_mod", model).load_state_dict(ck["model"])
+        optimizer.load_state_dict(ck["optimizer"])
+        scaler.load_state_dict(ck["scaler"])
+        start_iter, best_val = ck["iter"] + 1, ck["best_val"]
+        print(f"resumed from {latest_path} at iter {start_iter} (best_val {best_val:.4f})")
+
     t0 = time.time()
     model.train()
 
-    for it in range(args.max_iters + 1):
+    for it in range(start_iter, args.max_iters + 1):
         lr = get_lr(it, args.warmup, args.max_iters, args.lr, args.min_lr)
         for g in optimizer.param_groups:
             g["lr"] = lr
@@ -135,8 +156,9 @@ def main():
             if losses["val"] < best_val:
                 best_val = losses["val"]
                 raw = getattr(model, "_orig_mod", model)  # unwrap torch.compile
-                torch.save({"model": raw.state_dict(), "config": cfg, "val_loss": best_val},
-                           os.path.join(OUT_DIR, "ckpt.pt"))
+                torch.save({"model": raw.state_dict(), "config": cfg, "val_loss": best_val}, best_path)
+            # rolling full-state checkpoint for resume (overwrites, bounded disk)
+            save_full(latest_path, model, optimizer, scaler, it, best_val, cfg)
 
         if it == args.max_iters:
             break

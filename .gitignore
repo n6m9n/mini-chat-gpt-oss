@@ -13,13 +13,20 @@ __pycache__/
 # VS Code
 .vscode/
 
-
 # Jupyter
 .ipynb_checkpoints/
 
-# Model checkpoints
+# Model checkpoints & training data (generated locally / on Kaggle)
 *.pt
 *.pth
 *.ckpt
+**/data/
+**/out/
+*.bin
+*.npy
 
-mini-gpt-oss-architecture.excalidraw
+# Excalidraw source (large JSON diagrams)
+*.excalidraw
+
+# Paper PDF (not redistributed here)
+*.pdf

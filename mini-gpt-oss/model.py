@@ -13,14 +13,6 @@ Architecture (faithful to gpt-oss):
   * Mixture-of-Experts (MoE) MLP with top-k routing
   * Clamped SwiGLU activation (alpha=1.702, limit=7.0) with the interleaved gate
 
-Deliberate changes vs the reference gptoss.py:
-  * float32 + device-agnostic (CPU / MPS / CUDA), with a batch dim [B, T] so we
-    can train efficiently (the reference processes one ungrouped token stream).
-  * weight tying between the embedding and the output projection. The o200k
-    vocab (201,088) is huge and mostly unused on TinyStories; tying halves the
-    dominant embedding cost and lets the budget go to real transformer capacity.
-  * an optional MoE load-balancing auxiliary loss (Switch-Transformer style) so
-    the router does not collapse onto a few experts during training.
 """
 
 import math
@@ -59,7 +51,7 @@ class ModelConfig:
     # RoPE / YaRN
     rope_theta: float = 10000.0
     initial_context_length: int = 512
-    rope_scaling_factor: float = 1.0  # 1.0 => plain RoPE (no context extension)
+    rope_scaling_factor: float = 1.0  # 1.0 => plain RoPE 
     rope_ntk_alpha: float = 1.0
     rope_ntk_beta: float = 32.0
 
@@ -149,7 +141,7 @@ class AttentionBlock(nn.Module):
         self.q_mult = self.nh // self.nkv
         assert self.nh % self.nkv == 0, "num_attention_heads must be divisible by num_key_value_heads"
 
-        # gpt-oss alternates: even layers sliding window, odd layers full attention
+        # gpt-oss : even layers sliding window, odd layers full attention
         self.sliding_window = config.sliding_window if layer_idx % 2 == 0 else 0
 
         self.norm = RMSNorm(config.hidden_size)

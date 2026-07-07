@@ -22,7 +22,7 @@ import numpy as np
 from tokenizer import EOT, get_tokenizer
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-DATA_DIR = os.path.join(HERE, "data")
+DATA_DIR = os.environ.get("DATA_DIR", os.path.join(HERE, "data"))
 
 SAMPLE_DOCS = [
     "Once upon a time, there was a little cat named Tom. Tom liked to play in the "
