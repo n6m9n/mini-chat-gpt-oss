@@ -15,12 +15,18 @@ and the ModelConfig, so generate.py is self-contained.
 """
 
 import argparse
+import math
 import os
 import time
 from contextlib import nullcontext
 
 import numpy as np
 import torch
+
+try:
+    import wandb
+except ImportError:
+    wandb = None
 
 from model import MiniGPTOSS, ModelConfig
 from tokenizer import VOCAB_SIZE
@@ -134,6 +140,31 @@ def main():
         model.parameters(), lr=args.lr, weight_decay=args.weight_decay, betas=(0.9, 0.95)
     )
 
+    # ---- Weights & Biases (activate via WANDB_PROJECT env var) ----
+    use_wandb = wandb is not None and os.environ.get("WANDB_PROJECT")
+    if use_wandb:
+        wandb.init(
+            project=os.environ["WANDB_PROJECT"],
+            name=os.environ.get("WANDB_NAME", "baseline-moe"),
+            config={
+                "model": "mini-gpt-oss",
+                "params_M": model.num_params() / 1e6,
+                "non_emb_params_M": model.num_params(non_embedding=True) / 1e6,
+                "batch_size": args.batch_size,
+                "grad_accum": args.grad_accum,
+                "block_size": args.block_size,
+                "max_iters": args.max_iters,
+                "lr": args.lr,
+                "min_lr": args.min_lr,
+                "warmup": args.warmup,
+                "weight_decay": args.weight_decay,
+                "grad_clip": args.grad_clip,
+                "device": device,
+                "seed": args.seed,
+            },
+        )
+        print("[wandb] logging enabled")
+
     os.makedirs(OUT_DIR, exist_ok=True)
     latest_path = os.path.join(OUT_DIR, "latest.pt")
     best_path = os.path.join(OUT_DIR, "ckpt.pt")
@@ -166,6 +197,19 @@ def main():
                 torch.save({"model": raw.state_dict(), "config": cfg, "val_loss": best_val}, best_path)
             # rolling full-state checkpoint for resume (overwrites, bounded disk)
             save_full(latest_path, model, optimizer, scaler, it, best_val, cfg)
+            if use_wandb:
+                log = {
+                    "eval/train_loss": losses["train"],
+                    "eval/val_loss": losses["val"],
+                    "eval/train_ppl": math.exp(losses["train"]),
+                    "eval/val_ppl": math.exp(losses["val"]),
+                    "eval/best_val_loss": best_val,
+                    "lr": lr,
+                }
+                if device_type == "cuda":
+                    log["gpu/mem_allocated_GB"] = torch.cuda.memory_allocated() / 1e9
+                    log["gpu/mem_reserved_GB"] = torch.cuda.memory_reserved() / 1e9
+                wandb.log(log, step=it)
 
         if it == args.max_iters:
             break
@@ -194,8 +238,17 @@ def main():
             print(f"iter {it:6d}/{args.max_iters} ({100 * it / args.max_iters:4.1f}%) | "
                   f"loss {loss.item() * args.grad_accum:.3f} | {tps:6.0f} tok/s | "
                   f"elapsed {fmt_hms(now - t0)} | eta {fmt_hms(eta)}", flush=True)
+            if use_wandb:
+                wandb.log({
+                    "train/loss": loss.item() * args.grad_accum,
+                    "train/tok_per_sec": tps,
+                    "lr": lr,
+                }, step=it)
 
     print(f"done. best val loss: {best_val:.4f}  ->  {best_path}", flush=True)
+    if use_wandb:
+        wandb.log({"final/best_val_loss": best_val, "final/best_val_ppl": math.exp(best_val)})
+        wandb.finish()
 
 
 if __name__ == "__main__":
